@@ -59,11 +59,16 @@ jobs:
 
     steps:
       - name: Check out fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # Full history: the fast-forward test is a merge-base question, and a shallow clone
           # cannot answer it.
           fetch-depth: 0
+          # But history here means the commit graph, not the payload. This mirrors a repo of
+          # large JSON blobs, and a full-depth checkout otherwise downloads every historical
+          # version of every one of them to answer a question about ancestry. blob:none fetches
+          # blobs only for the files actually checked out — on the automation branch, two.
+          filter: blob:none
 
       - name: Resolve upstream
         id: upstream
