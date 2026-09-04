@@ -1,0 +1,271 @@
+# Keeps this fork's mirror branch level with swgoh-utils/gamedata, and pings Discord when it
+# moves — because a fork advancing on GitHub is a local clone going stale with no visible
+# symptom, and the gamedata feed going stale is a wrong answer about what is in this pull.
+#
+# The branch this runs from is deliberately not the branch it syncs. GitHub only fires
+# `schedule` on the default branch, so the workflow file has to live there — and any file
+# committed to the mirror branch diverges it from upstream permanently, after which nothing
+# ever fast-forwards again. Hence SYNC_BRANCH: the default branch carries the automation, the
+# mirror branch stays byte-identical to upstream.
+#
+# Setup, all one-time, under repo Settings:
+#   * Secret DISCORD_WEBHOOK_URL — Discord: Server Settings > Integrations > Webhooks > Copy URL.
+#   * Variable SYNC_BRANCH — the mirror branch to keep level (e.g. `main`). Omit it and the
+#     default branch is synced, which is right only when the workflow does not live on it.
+#   * The upstream is read from GitHub's own fork relationship. Set the variable UPSTREAM_REPO
+#     (`owner/name`) only for a copy that is not a real fork; UPSTREAM_BRANCH only to track a
+#     branch other than upstream's default.
+#
+# Two settings can turn a sync into a failure:
+#   * Branch protection on SYNC_BRANCH blocks the fast-forward push.
+#   * Actions > General > "Allow GitHub Actions to create and approve pull requests" must be on
+#     for the diverged-history fallback to open its PR.
+
+name: Sync fork with upstream
+
+on:
+  schedule:
+    # Every six hours. The feed moves in bursts around a game update, and a mirror checked once
+    # a day is a mirror that is wrong for most of one. Odd minute on purpose: the top of the
+    # hour is when every scheduled workflow on GitHub queues at once, and scheduled runs are
+    # dropped under load rather than delayed.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      notify_when_unchanged:
+        description: "Send a Discord message even when there is nothing new"
+        type: boolean
+        default: false
+
+# Never let two syncs race for the same branch.
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # The branch to sync. Independent of the branch this job runs from, because
+      # `schedule` only ever fires on the default branch — so keeping a mirror branch
+      # pristine means running the job from elsewhere and naming its target here.
+      TARGET_BRANCH: ${{ vars.SYNC_BRANCH || github.event.repository.default_branch }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+        with:
+          # Full history: the fast-forward test is a merge-base question, and a shallow clone
+          # cannot answer it.
+          fetch-depth: 0
+
+      - name: Resolve upstream
+        id: upstream
+        env:
+          UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+          UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH }}
+        run: |
+          set -euo pipefail
+
+          repo="${UPSTREAM_REPO:-}"
+          if [ -z "$repo" ]; then
+            repo="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.full_name // empty')"
+          fi
+          if [ -z "$repo" ]; then
+            echo "::error::No upstream. This repository is not a fork of anything GitHub knows about — set the UPSTREAM_REPO variable to owner/name."
+            exit 1
+          fi
+
+          branch="${UPSTREAM_BRANCH:-}"
+          if [ -z "$branch" ]; then
+            branch="$(gh api "repos/${repo}" --jq '.default_branch')"
+          fi
+
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "Upstream: ${repo}@${branch} -> ${GITHUB_REPOSITORY}@${TARGET_BRANCH}"
+
+      - name: Compare against upstream
+        id: compare
+        env:
+          UPSTREAM_REPO: ${{ steps.upstream.outputs.repo }}
+          UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin "$TARGET_BRANCH"
+          target_sha="$(git rev-parse FETCH_HEAD)"
+
+          git remote add upstream "${GITHUB_SERVER_URL}/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          upstream_sha="$(git rev-parse FETCH_HEAD)"
+
+          behind="$(git rev-list --count "${target_sha}..${upstream_sha}")"
+
+          # Ahead-only or identical: nothing to pull down.
+          if [ "$behind" -eq 0 ]; then
+            echo "behind=0" >> "$GITHUB_OUTPUT"
+            echo "Already up to date with ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}."
+            exit 0
+          fi
+
+          # Fast-forwardable exactly when the target tip is an ancestor of theirs.
+          if git merge-base --is-ancestor "$target_sha" "$upstream_sha"; then
+            fast_forward=true
+          else
+            fast_forward=false
+          fi
+
+          # Cap the log: Discord rejects an embed description over 4096 characters, and a
+          # 300-commit dump is not a notification anyway. `-n 20` rather than `| head -20`
+          # because SIGPIPE-ing git under `pipefail` would fail this step on a busy upstream.
+          commit_url="${GITHUB_SERVER_URL}/${UPSTREAM_REPO}/commit"
+          log="$(git log -n 20 --reverse --format="- [\`%h\`](${commit_url}/%H) %s" "${target_sha}..${upstream_sha}")"
+          if [ "$behind" -gt 20 ]; then
+            log="- …and $((behind - 20)) older commit(s)"$'\n'"${log}"
+          fi
+
+          {
+            echo "behind=$behind"
+            echo "fast_forward=$fast_forward"
+            echo "upstream_sha=$upstream_sha"
+            echo "short_sha=${upstream_sha:0:7}"
+            echo "log<<COMMIT_LOG_EOF"
+            echo "$log"
+            echo "COMMIT_LOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Apply upstream changes
+        id: apply
+        if: steps.compare.outputs.behind != '0'
+        env:
+          UPSTREAM_REPO: ${{ steps.upstream.outputs.repo }}
+          UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
+          UPSTREAM_SHA: ${{ steps.compare.outputs.upstream_sha }}
+          BEHIND: ${{ steps.compare.outputs.behind }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ steps.compare.outputs.fast_forward }}" = "true" ]; then
+            git push origin "${UPSTREAM_SHA}:refs/heads/${TARGET_BRANCH}"
+            echo "outcome=fast-forward" >> "$GITHUB_OUTPUT"
+            echo "Fast-forwarded ${TARGET_BRANCH} to ${UPSTREAM_SHA}."
+            exit 0
+          fi
+
+          # Histories diverged: this fork carries commits upstream does not have. Merging that
+          # unattended is how a fork loses work, so it becomes a pull request instead.
+          branch="upstream-sync/${UPSTREAM_SHA:0:12}"
+          echo "outcome=pull-request" >> "$GITHUB_OUTPUT"
+
+          existing="$(gh pr list --state open --head "$branch" --json url --jq '.[0].url // empty')"
+          if [ -n "$existing" ]; then
+            echo "pr_url=$existing" >> "$GITHUB_OUTPUT"
+            echo "Sync PR already open: $existing"
+            exit 0
+          fi
+
+          git push --force origin "${UPSTREAM_SHA}:refs/heads/${branch}"
+
+          body="$(printf '%s\n' \
+            "\`${TARGET_BRANCH}\` has diverged from \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`, so this sync could not fast-forward." \
+            "" \
+            "${BEHIND} upstream commit(s) are not in this fork. Merging this PR brings them in and preserves the commits this fork added on top." \
+            "" \
+            "Opened by [\`sync-upstream.yml\`](${RUN_URL})." )"
+
+          url="$(gh pr create \
+            --base "$TARGET_BRANCH" \
+            --head "$branch" \
+            --title "Sync ${TARGET_BRANCH} with ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} (${BEHIND} commits)" \
+            --body "$body")"
+          echo "pr_url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Discord
+        if: always() && (steps.compare.outputs.behind != '0' || failure() || inputs.notify_when_unchanged)
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          UPSTREAM_REPO: ${{ steps.upstream.outputs.repo }}
+          UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
+          BEHIND: ${{ steps.compare.outputs.behind }}
+          SHORT_SHA: ${{ steps.compare.outputs.short_sha }}
+          COMMIT_LOG: ${{ steps.compare.outputs.log }}
+          OUTCOME: ${{ steps.apply.outputs.outcome }}
+          PR_URL: ${{ steps.apply.outputs.pr_url }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${DISCORD_WEBHOOK_URL:-}" ]; then
+            echo "::warning::DISCORD_WEBHOOK_URL is not set — the sync ran, but nobody was told. Add it under Settings > Secrets and variables > Actions."
+            exit 0
+          fi
+
+          # Leading newline: Discord only renders a fence that starts its own line.
+          pull_cmd=$'\n```sh\ngit pull\n```'
+
+          case "${JOB_STATUS}:${OUTCOME:-none}" in
+            failure:*|cancelled:*)
+              color=15158332
+              title="Fork sync failed"
+              desc="Could not sync \`${GITHUB_REPOSITORY}\` from \`${UPSTREAM_REPO:-unknown}\`. Nothing was pushed."
+              ;;
+            *:fast-forward)
+              color=3066993
+              title="${BEHIND} new commit(s) — local pull needed"
+              desc="\`${GITHUB_REPOSITORY}@${TARGET_BRANCH}\` was fast-forwarded to \`${SHORT_SHA}\` from \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`. Your local clone is now behind:${pull_cmd}"$'\n'"${COMMIT_LOG}"
+              ;;
+            *:pull-request)
+              color=15105570
+              title="${BEHIND} new commit(s) — review needed before pulling"
+              desc="\`${TARGET_BRANCH}\` has diverged from \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`, so the sync opened a pull request rather than force anything: ${PR_URL}"$'\n\n'"${COMMIT_LOG}"
+              ;;
+            *)
+              color=9807270
+              title="Fork is up to date"
+              desc="\`${GITHUB_REPOSITORY}@${TARGET_BRANCH}\` matches \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`. Nothing to pull."
+              ;;
+          esac
+
+          # 4096 is Discord's embed description ceiling; over it the whole POST is rejected.
+          desc="${desc:0:4000}"
+
+          jq -n \
+            --arg title "$title" \
+            --arg desc "$desc" \
+            --arg url "$RUN_URL" \
+            --argjson color "$color" \
+            '{username: "Fork Sync",
+              embeds: [{title: $title, url: $url, description: $desc, color: $color}]}' \
+            > "${RUNNER_TEMP}/discord.json"
+
+          curl -sS --fail-with-body -X POST \
+            -H "Content-Type: application/json" \
+            --data @"${RUNNER_TEMP}/discord.json" \
+            "$DISCORD_WEBHOOK_URL"
+
+      - name: Write run summary
+        if: always()
+        run: |
+          {
+            echo "## Fork sync"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Upstream | \`${{ steps.upstream.outputs.repo }}@${{ steps.upstream.outputs.branch }}\` |"
+            echo "| Behind by | ${{ steps.compare.outputs.behind || '0' }} commit(s) |"
+            echo "| Outcome | ${{ steps.apply.outputs.outcome || 'nothing to do' }} |"
+            if [ -n "${{ steps.apply.outputs.pr_url }}" ]; then
+              echo "| Pull request | ${{ steps.apply.outputs.pr_url }} |"
+            fi
+            echo
+            echo '```sh'
+            echo 'git pull'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
